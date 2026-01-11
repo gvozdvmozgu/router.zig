@@ -1,6 +1,7 @@
 # route-recognizer
 
-Fast router for path matching with static segments, params, param suffixes, and catchalls.
+High-performance route recognizer for Zig: fast path matching for HTTP routing and URL dispatch.
+Supports static segments, params, param suffixes, and catchall segments with escaped literal braces.
 
 Minimum Zig version: 0.15.2
 
