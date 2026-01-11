@@ -44,4 +44,4 @@ zig build bench-match -- --routes=900 --paths=9000 --iters=200
 
 ## Credits
 
-A lot of the code in this package was inspired by [`matchit`](github.com/ibraheemdev/matchit).
+A lot of the code in this package was inspired by [`matchit`](https://github.com/ibraheemdev/matchit).
