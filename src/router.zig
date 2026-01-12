@@ -31,6 +31,7 @@ pub fn Match(comptime T: type) type {
         value: *const T,
         params: Params,
 
+        /// Free owned params.
         pub fn deinit(self: *Self) void {
             self.params.deinit();
             self.* = undefined;
@@ -47,6 +48,7 @@ pub fn MatchMut(comptime T: type) type {
         value: *T,
         params: Params,
 
+        /// Free owned params.
         pub fn deinit(self: *Self) void {
             self.params.deinit();
             self.* = undefined;
@@ -61,9 +63,11 @@ const NodeType = union(enum) {
     Static,
 };
 
+/// Route matcher storing values of type T.
 pub fn Router(comptime T: type) type {
     return struct {
         const Self = @This();
+        /// Errors returned by match operations.
         pub const Error = Allocator.Error || MatchError;
         const Node = struct {
             const SelfNode = @This();
@@ -1356,6 +1360,7 @@ pub fn Router(comptime T: type) type {
         allocator: Allocator,
         root: Node,
 
+        /// Initialize an empty router using allocator for storage.
         pub fn init(allocator: Allocator) Self {
             return .{
                 .allocator = allocator,
@@ -1363,15 +1368,18 @@ pub fn Router(comptime T: type) type {
             };
         }
 
+        /// Release all memory owned by the router.
         pub fn deinit(self: *Self) void {
             self.root.deinit(self.allocator);
             self.* = undefined;
         }
 
+        /// Validate internal invariants (debug builds only).
         pub fn verify(self: *const Self) void {
             self.root.verify();
         }
 
+        /// Insert a route and value.
         pub fn insert(self: *Self, route_str: []const u8, value: T) Allocator.Error!InsertResult {
             var result: InsertResult = .ok;
             if (try self.root.insert(self.allocator, route_str, value)) |err| {
@@ -1381,21 +1389,25 @@ pub fn Router(comptime T: type) type {
             return result;
         }
 
+        /// Match a path and return the value and params.
         pub fn match(self: *const Self, path: []const u8) Error!Match(T) {
             return self.root.at(self.allocator, path);
         }
 
+        /// Match a path and return a mutable value pointer and params.
         pub fn matchMut(self: *Self, path: []const u8) Error!MatchMut(T) {
             const found = try self.root.at(self.allocator, path);
             return .{ .value = @constCast(found.value), .params = found.params };
         }
 
+        /// Remove a route and return its value if present.
         pub fn remove(self: *Self, route_str: []const u8) Allocator.Error!?T {
             const result = try self.root.remove(self.allocator, route_str);
             if (verify_enabled) self.verify();
             return result;
         }
 
+        /// Move routes from another router into this one, reporting conflicts.
         pub fn mergeFrom(self: *Self, other: *Self) Allocator.Error!MergeResult {
             const Entry = struct {
                 prefix: UnescapedRoute,

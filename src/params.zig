@@ -6,6 +6,7 @@ const Allocator = std.mem.Allocator;
 const ParamError = errors.ParamError;
 const UnescapedRoute = route.UnescapedRoute;
 
+/// Maps normalized parameter placeholders back to their original names.
 pub const ParamRemapping = struct {
     const Self = @This();
     const Name = struct {
@@ -41,10 +42,12 @@ pub const ParamRemapping = struct {
     }
 };
 
+/// Free memory held by a remapping.
 pub fn remappingDeinit(remapping: *ParamRemapping, allocator: Allocator) void {
     remapping.deinit(allocator);
 }
 
+/// Compare two remappings for identical parameter name order.
 pub fn remappingEqual(a: *const ParamRemapping, b: *const ParamRemapping) bool {
     const len = a.len();
     if (len != b.len()) return false;
@@ -58,6 +61,7 @@ pub fn remappingEqual(a: *const ParamRemapping, b: *const ParamRemapping) bool {
 // Normalization uses single-letter placeholders: {a}..{z}.
 const MAX_PARAMS: usize = @as(usize, 'z' - 'a' + 1);
 
+/// Replace parameter names with normalized placeholders and return a remapping.
 pub fn normalizeParams(
     allocator: Allocator,
     route_value: *UnescapedRoute,
@@ -95,6 +99,7 @@ pub fn normalizeParams(
     }
 }
 
+/// Restore parameter names in a normalized route using the provided remapping.
 pub fn denormalizeParams(
     allocator: Allocator,
     route_value: *UnescapedRoute,
@@ -126,10 +131,12 @@ pub fn denormalizeParams(
     }
 }
 
+/// Single route parameter key/value pair.
 pub const Param = struct {
     key: []const u8,
     value: []const u8,
 
+    /// Empty sentinel parameter.
     pub const empty = Param{ .key = "", .value = "" };
 };
 
@@ -184,10 +191,12 @@ const ParamsKind = union(enum) {
     Large: std.ArrayListUnmanaged(Param),
 };
 
+/// Compact parameter list that grows to a heap-backed list when needed.
 pub const Params = struct {
     allocator: Allocator,
     kind: ParamsKind,
 
+    /// Create a new parameter list backed by the provided allocator.
     pub fn init(allocator: Allocator) Params {
         return .{
             .allocator = allocator,
@@ -195,6 +204,7 @@ pub const Params = struct {
         };
     }
 
+    /// Release any allocations held by the list.
     pub fn deinit(self: *Params) void {
         switch (self.kind) {
             .Large => |*list| list.deinit(self.allocator),
@@ -203,6 +213,7 @@ pub const Params = struct {
         self.* = undefined;
     }
 
+    /// Number of parameters stored.
     pub fn len(self: *const Params) usize {
         return switch (self.kind) {
             .Small => |small| small.count(),
@@ -210,10 +221,12 @@ pub const Params = struct {
         };
     }
 
+    /// Returns true when no parameters are stored.
     pub fn isEmpty(self: *const Params) bool {
         return self.len() == 0;
     }
 
+    /// Look up a parameter value by key.
     pub fn get(self: *const Params, key: []const u8) ?[]const u8 {
         switch (self.kind) {
             .Small => |small| {
@@ -231,6 +244,7 @@ pub const Params = struct {
         return null;
     }
 
+    /// Iterate parameters in insertion order.
     pub fn iter(self: *const Params) ParamsIter {
         const items = switch (self.kind) {
             .Small => |*small| small.slice(),
@@ -239,6 +253,7 @@ pub const Params = struct {
         return .{ .items = items, .index = 0 };
     }
 
+    /// Truncate the list to the first n parameters.
     pub fn truncate(self: *Params, n: usize) void {
         switch (self.kind) {
             .Small => |*small| {
@@ -254,6 +269,7 @@ pub const Params = struct {
         }
     }
 
+    /// Append a parameter key/value pair.
     pub fn push(self: *Params, key: []const u8, value: []const u8) Allocator.Error!void {
         const param = Param{ .key = key, .value = value };
 
@@ -275,6 +291,7 @@ pub const Params = struct {
         }
     }
 
+    /// Rewrite parameter keys based on a remapping.
     pub fn applyRemapping(self: *Params, remapping: *const ParamRemapping) void {
         switch (self.kind) {
             .Small => |*small| {
@@ -296,15 +313,18 @@ pub const Params = struct {
     }
 };
 
+/// Public key/value view used by ParamsIter.
 pub const ParamKV = struct {
     key: []const u8,
     value: []const u8,
 };
 
+/// Iterator over Params.
 pub const ParamsIter = struct {
     items: []const Param,
     index: usize,
 
+    /// Return the next key/value pair, or null when exhausted.
     pub fn next(self: *ParamsIter) ?ParamKV {
         if (self.index >= self.items.len) return null;
         const param = self.items[self.index];
@@ -312,6 +332,7 @@ pub const ParamsIter = struct {
         return .{ .key = param.key, .value = param.value };
     }
 
+    /// Remaining items in the iterator.
     pub fn len(self: *const ParamsIter) usize {
         std.debug.assert(self.index <= self.items.len);
         return self.items.len - self.index;

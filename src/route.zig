@@ -4,10 +4,12 @@ const errors = @import("errors.zig");
 const Allocator = std.mem.Allocator;
 const ParamError = errors.ParamError;
 
+/// Byte range within a route.
 pub const Range = struct {
     start: usize,
     end: usize,
 
+    /// Length of the range.
     pub fn len(self: Range) usize {
         return self.end - self.start;
     }
@@ -33,6 +35,7 @@ fn assertEscapedInvariant(escaped: []const usize, len: usize) void {
     }
 }
 
+/// Return the index just past the end of the current path segment.
 pub fn segmentTerminator(bytes: []const u8) usize {
     if (std.mem.indexOfScalar(u8, bytes, '/')) |idx| {
         return idx + 1;
@@ -40,14 +43,17 @@ pub fn segmentTerminator(bytes: []const u8) usize {
     return bytes.len;
 }
 
+/// True when the slice is empty or a single "/".
 pub fn isEmptyOrSlash(bytes: []const u8) bool {
     return bytes.len == 0 or (bytes.len == 1 and bytes[0] == '/');
 }
 
+/// Owned route string with escape tracking for literal braces.
 pub const UnescapedRoute = struct {
     inner: std.ArrayListUnmanaged(u8) = .{},
     escaped: std.ArrayListUnmanaged(usize) = .{},
 
+    /// Build a route from bytes, unescaping doubled braces.
     pub fn init(allocator: Allocator, bytes: []const u8) Allocator.Error!UnescapedRoute {
         var route = UnescapedRoute{};
         try route.inner.appendSlice(allocator, bytes);
@@ -66,12 +72,14 @@ pub const UnescapedRoute = struct {
         return route;
     }
 
+    /// Free allocations held by the route.
     pub fn deinit(self: *UnescapedRoute, allocator: Allocator) void {
         self.inner.deinit(allocator);
         self.escaped.deinit(allocator);
         self.* = undefined;
     }
 
+    /// Clone the route, including escape metadata.
     pub fn clone(self: *const UnescapedRoute, allocator: Allocator) Allocator.Error!UnescapedRoute {
         var route = UnescapedRoute{};
         try route.inner.appendSlice(allocator, self.inner.items);
@@ -79,20 +87,24 @@ pub const UnescapedRoute = struct {
         return route;
     }
 
+    /// Return a newly allocated copy of the unescaped bytes.
     pub fn toOwnedUnescaped(self: *const UnescapedRoute, allocator: Allocator) Allocator.Error![]u8 {
         const out = try allocator.alloc(u8, self.inner.items.len);
         @memcpy(out, self.inner.items);
         return out;
     }
 
+    /// Length of the unescaped route.
     pub fn len(self: *const UnescapedRoute) usize {
         return self.inner.items.len;
     }
 
+    /// True if the byte at idx originated from an escaped brace.
     pub fn isEscaped(self: *const UnescapedRoute, idx: usize) bool {
         return containsUsize(self.escaped.items, idx);
     }
 
+    /// Replace a range with new bytes while maintaining escape tracking.
     pub fn splice(
         self: *UnescapedRoute,
         allocator: Allocator,
@@ -134,6 +146,7 @@ pub const UnescapedRoute = struct {
         assertEscapedInvariant(self.escaped.items, self.inner.items.len);
     }
 
+    /// Append another route to this one, preserving escape metadata.
     pub fn append(
         self: *UnescapedRoute,
         allocator: Allocator,
@@ -147,6 +160,7 @@ pub const UnescapedRoute = struct {
         try self.inner.appendSlice(allocator, other.inner.items);
     }
 
+    /// Truncate the route to the given length.
     pub fn truncate(self: *UnescapedRoute, to: usize) void {
         std.debug.assert(to <= self.inner.items.len);
         assertEscapedInvariant(self.escaped.items, self.inner.items.len);
@@ -162,6 +176,7 @@ pub const UnescapedRoute = struct {
         assertEscapedInvariant(self.escaped.items, self.inner.items.len);
     }
 
+    /// Borrow a read-only view with escape metadata.
     pub fn asRef(self: *const UnescapedRoute) UnescapedRef {
         return .{
             .inner = self.inner.items,
@@ -170,16 +185,19 @@ pub const UnescapedRoute = struct {
         };
     }
 
+    /// Borrow the unescaped bytes.
     pub fn unescaped(self: *const UnescapedRoute) []const u8 {
         return self.inner.items;
     }
 };
 
+/// Borrowed view of an unescaped route with escape metadata.
 pub const UnescapedRef = struct {
     inner: []const u8,
     escaped: []const usize,
     offset: isize,
 
+    /// Convert the view into an owned UnescapedRoute.
     pub fn toOwned(self: UnescapedRef, allocator: Allocator) Allocator.Error!UnescapedRoute {
         var route = UnescapedRoute{};
         try route.inner.appendSlice(allocator, self.inner);
@@ -195,12 +213,14 @@ pub const UnescapedRef = struct {
         return route;
     }
 
+    /// True if the byte at idx originated from an escaped brace.
     pub fn isEscaped(self: UnescapedRef, idx: usize) bool {
         const adjusted = @as(isize, @intCast(idx)) - self.offset;
         if (adjusted < 0) return false;
         return containsUsize(self.escaped, @intCast(adjusted));
     }
 
+    /// Slice from start to end while keeping escape metadata.
     pub fn sliceOff(self: UnescapedRef, start: usize) UnescapedRef {
         return .{
             .inner = self.inner[start..],
@@ -209,6 +229,7 @@ pub const UnescapedRef = struct {
         };
     }
 
+    /// Slice the first end bytes while keeping escape metadata.
     pub fn sliceUntil(self: UnescapedRef, end: usize) UnescapedRef {
         return .{
             .inner = self.inner[0..end],
@@ -217,11 +238,13 @@ pub const UnescapedRef = struct {
         };
     }
 
+    /// Borrow the unescaped bytes.
     pub fn unescaped(self: UnescapedRef) []const u8 {
         return self.inner;
     }
 };
 
+/// Find the next wildcard range in a route segment.
 pub fn findWildcard(path: UnescapedRef) ParamError!?Range {
     var start: usize = 0;
     while (start < path.inner.len) : (start += 1) {
