@@ -25,6 +25,13 @@ jobs:
       - run: zig version
       - run: zig build docs
       - run: |
+          rm -f zig-out/docs/sources.tar
+          rm -rf docs-sources
+          mkdir -p docs-sources/router
+          cp -R src/*.zig docs-sources/router/
+          tar -cf zig-out/docs/sources.tar -C docs-sources router
+          rm -rf docs-sources
+      - run: |
           mkdir -p site
           cp -R zig-out/docs/* site/
       - uses: actions/upload-pages-artifact@v3
