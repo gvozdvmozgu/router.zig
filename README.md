@@ -5,6 +5,23 @@ Supports static segments, params, param suffixes, and catchall segments with esc
 
 Minimum Zig version: 0.15.2
 
+## Install
+Add the dependency:
+```sh
+zig fetch --save git+https://github.com/gvozdvmozgu/zig-router
+```
+
+Then wire it into your `build.zig`:
+```zig
+const router_dep = b.dependency("router", .{});
+exe.root_module.addImport("router", router_dep.module("router"));
+```
+
+Use it in code:
+```zig
+const router = @import("router");
+```
+
 ## Route syntax
 - Static: `/about/team`
 - Param: `/users/{id}`
