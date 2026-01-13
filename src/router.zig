@@ -22,7 +22,9 @@ const segmentTerminator = route.segmentTerminator;
 const isEmptyOrSlash = route.isEmptyOrSlash;
 const verify_enabled = std.debug.runtime_safety;
 
-/// Result of a successful match. Owns its Params; call deinit when done.
+/// Result of a successful match. Owns its Params container; call deinit when done.
+/// Param keys borrow from the router and are invalidated by router mutations
+/// (insert/remove/merge) or deinit; values borrow from the input path.
 /// The value pointer is borrowed from the router and is invalidated by router
 /// mutations (insert/remove/merge) or deinit.
 pub fn Match(comptime T: type) type {
@@ -39,7 +41,9 @@ pub fn Match(comptime T: type) type {
     };
 }
 
-/// Mutable result of a successful match. Owns its Params; call deinit when done.
+/// Mutable result of a successful match. Owns its Params container; call deinit when done.
+/// Param keys borrow from the router and are invalidated by router mutations
+/// (insert/remove/merge) or deinit; values borrow from the input path.
 /// The value pointer is borrowed from the router and is invalidated by router
 /// mutations (insert/remove/merge) or deinit.
 pub fn MatchMut(comptime T: type) type {
@@ -487,26 +491,34 @@ pub fn Router(comptime T: type) type {
                 const prefix_ref = node_mut.prefix.asRef();
                 const index_byte = prefix_ref.inner[common_prefix];
 
+                var new_prefix = try prefix_ref.sliceUntil(common_prefix).toOwned(allocator);
+                errdefer new_prefix.deinit(allocator);
+
                 const child = try SelfNode.create(allocator);
                 var child_owned = true;
                 errdefer if (child_owned) child.destroy(allocator);
                 child.prefix = try prefix_ref.sliceOff(common_prefix).toOwned(allocator);
-                const new_prefix = try prefix_ref.sliceUntil(common_prefix).toOwned(allocator);
+
+                var new_children = std.MultiArrayList(ChildEntry){};
+                var new_children_owned = true;
+                errdefer if (new_children_owned) new_children.deinit(allocator);
+                try new_children.ensureUnusedCapacity(allocator, 1);
+                new_children.appendAssumeCapacity(.{ .index = index_byte, .node = child });
+
                 child.value = node_mut.value;
                 node_mut.value = null;
                 child.wild_child = node_mut.wild_child;
                 node_mut.wild_child = false;
                 child.children = node_mut.children;
-                node_mut.children = .{};
                 child.remapping = node_mut.remapping;
-                node_mut.remapping = .{};
                 child.priority = node_mut.priority - 1;
                 child.node_type = .Static;
 
+                node_mut.children = new_children;
+                new_children_owned = false;
+                node_mut.remapping = .{};
                 node_mut.prefix.deinit(allocator);
                 node_mut.prefix = new_prefix;
-                node_mut.children = .{};
-                _ = try node_mut.addStaticChild(allocator, index_byte, child);
                 child_owned = false;
                 return true;
             }
@@ -689,16 +701,18 @@ pub fn Router(comptime T: type) type {
                     }
                 }
 
+                try node_mut.children.ensureUnusedCapacity(allocator, 1);
+
                 const child = try SelfNode.create(allocator);
                 var child_owned = true;
                 errdefer if (child_owned) child.destroy(allocator);
-                const child_index = try node_mut.addStaticChild(allocator, remaining.inner[0], child);
-                child_owned = false;
-                const updated = node_mut.updateChildPriority(child_index);
-
-                if (try node_mut.childNode(updated).insertRoute(allocator, remaining, value, remapping)) |err| {
+                if (try child.insertRoute(allocator, remaining, value, remapping)) |err| {
                     return err;
                 }
+
+                const child_index = try node_mut.addStaticChild(allocator, remaining.inner[0], child);
+                child_owned = false;
+                _ = node_mut.updateChildPriority(child_index);
 
                 return null;
             }
@@ -769,9 +783,10 @@ pub fn Router(comptime T: type) type {
                 while (true) {
                     const wildcard_opt = findWildcard(remaining) catch return .{ .InvalidParam = {} };
                     if (wildcard_opt == null) {
+                        const new_prefix = try remaining.toOwned(allocator);
                         node.value = value;
                         node.prefix.deinit(allocator);
-                        node.prefix = try remaining.toOwned(allocator);
+                        node.prefix = new_prefix;
                         remappingDeinit(&node.remapping, allocator);
                         node.remapping = remapping.*;
                         remapping.* = .{};
@@ -786,8 +801,9 @@ pub fn Router(comptime T: type) type {
                         }
 
                         if (wildcard.start > 0) {
+                            const new_prefix = try remaining.sliceUntil(wildcard.start).toOwned(allocator);
                             node.prefix.deinit(allocator);
-                            node.prefix = try remaining.sliceUntil(wildcard.start).toOwned(allocator);
+                            node.prefix = new_prefix;
                             remaining = remaining.sliceOff(wildcard.start);
                         }
 
@@ -809,8 +825,9 @@ pub fn Router(comptime T: type) type {
                     }
 
                     if (wildcard.start > 0) {
+                        const new_prefix = try remaining.sliceUntil(wildcard.start).toOwned(allocator);
                         node.prefix.deinit(allocator);
-                        node.prefix = try remaining.sliceUntil(wildcard.start).toOwned(allocator);
+                        node.prefix = new_prefix;
                         remaining = remaining.sliceOff(wildcard.start);
                     }
 
@@ -860,13 +877,20 @@ pub fn Router(comptime T: type) type {
                     }
 
                     if (remaining.inner[0] != '{' or remaining.isEscaped(0)) {
+                        try node.children.ensureUnusedCapacity(allocator, 1);
+
                         const static_child = try SelfNode.create(allocator);
                         var static_owned = true;
                         errdefer if (static_owned) static_child.destroy(allocator);
-                        static_child.priority = 1;
+
+                        if (try static_child.insertRoute(allocator, remaining, value, remapping)) |err| {
+                            return err;
+                        }
+
                         const static_index = try node.addStaticChild(allocator, remaining.inner[0], static_child);
                         static_owned = false;
-                        node = node.childNode(static_index);
+                        _ = node.updateChildPriority(static_index);
+                        return null;
                     }
                 }
             }
@@ -1408,6 +1432,7 @@ pub fn Router(comptime T: type) type {
         }
 
         /// Move routes from another router into this one, reporting conflicts.
+        /// Routes that merge are removed from `other`; conflicting routes remain in `other`.
         pub fn mergeFrom(self: *Self, other: *Self) Allocator.Error!MergeResult {
             const Entry = struct {
                 prefix: UnescapedRoute,
@@ -1425,8 +1450,10 @@ pub fn Router(comptime T: type) type {
                 stack.deinit(self.allocator);
             }
 
-            const root_prefix = try other.root.prefix.clone(self.allocator);
+            var root_prefix = try other.root.prefix.clone(self.allocator);
+            errdefer root_prefix.deinit(self.allocator);
             try stack.append(self.allocator, .{ .prefix = root_prefix, .node = &other.root });
+            root_prefix = .{};
 
             while (stack.items.len > 0) {
                 var entry = stack.pop().?;
@@ -1435,10 +1462,16 @@ pub fn Router(comptime T: type) type {
                 try denormalizeParams(self.allocator, &entry.prefix, &entry.node.remapping);
 
                 if (entry.node.value) |value| {
+                    const escaped_route = try entry.prefix.toOwnedEscaped(self.allocator);
+                    defer self.allocator.free(escaped_route);
+
                     entry.node.value = null;
-                    switch (try self.insert(entry.prefix.unescaped(), value)) {
+                    errdefer entry.node.value = value;
+
+                    switch (try self.insert(escaped_route, value)) {
                         .ok => {},
                         .err => |err| {
+                            entry.node.value = value;
                             var owned_err = err;
                             errdefer owned_err.deinit(self.allocator);
                             try errors_value.errors.append(self.allocator, owned_err);
@@ -1458,11 +1491,10 @@ pub fn Router(comptime T: type) type {
 
             stack.deinit(self.allocator);
 
-            other.root.deinit(other.allocator);
-            other.root = Node.initEmpty();
-
             var result: MergeResult = undefined;
             if (errors_value.errors.items.len == 0) {
+                other.root.deinit(other.allocator);
+                other.root = Node.initEmpty();
                 errors_value.deinit(self.allocator);
                 result = .ok;
             } else {

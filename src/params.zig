@@ -109,7 +109,7 @@ pub fn denormalizeParams(
     var i: usize = 0;
 
     while (true) {
-        const wildcard_opt = route.findWildcard(route_value.asRef().sliceOff(start)) catch unreachable;
+        const wildcard_opt = route.findWildcard(route_value.asRef().sliceOff(start)) catch return;
         if (wildcard_opt == null) return;
         var wildcard = wildcard_opt.?;
         wildcard.start += start;
@@ -192,6 +192,7 @@ const ParamsKind = union(enum) {
 };
 
 /// Compact parameter list that grows to a heap-backed list when needed.
+/// Keys and values are borrowed slices; the list only owns its container storage.
 pub const Params = struct {
     allocator: Allocator,
     kind: ParamsKind,

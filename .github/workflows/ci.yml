@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  test:
+  fmt:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -20,5 +20,48 @@ jobs:
       - name: Check formatting
         run: zig build test:fmt
 
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        optimize: [Debug, ReleaseSafe, ReleaseFast]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.15.2
+
       - name: Run tests
-        run: zig build test:unit
+        run: zig build test:unit -Doptimize=${{ matrix.optimize }}
+
+  sanitize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Check sanitizer support
+        id: sanitize
+        run: |
+          if zig test -h 2>&1 | grep -q "fsanitize"; then
+            echo "supported=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "supported=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run address sanitizer tests
+        if: steps.sanitize.outputs.supported == 'true'
+        run: zig test src/all_tests.zig -OReleaseSafe -fsanitize=address
+
+      - name: Run undefined sanitizer tests
+        if: steps.sanitize.outputs.supported == 'true'
+        run: zig test src/all_tests.zig -OReleaseSafe -fsanitize=undefined

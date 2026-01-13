@@ -3,6 +3,27 @@ const lib = @import("lib.zig");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 
+fn withGpa(
+    ctx: anytype,
+    comptime f: fn (@TypeOf(ctx), Allocator) anyerror!void,
+) !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer {
+        const status = gpa.deinit();
+        testing.expect(status == .ok) catch @panic("leak detected");
+    }
+    try f(ctx, gpa.allocator());
+}
+
+fn checkAllOomPoints(comptime test_fn: anytype, extra_args: anytype) !void {
+    const Args = @TypeOf(extra_args);
+    try withGpa(extra_args, struct {
+        fn run(args: Args, allocator: Allocator) !void {
+            try testing.checkAllAllocationFailures(allocator, test_fn, args);
+        }
+    }.run);
+}
+
 const ExpectedInsert = union(enum) {
     ok,
     conflict: []const u8,
@@ -68,15 +89,38 @@ fn expectInsertOk(allocator: Allocator, got: lib.InsertResult) !void {
     }
 }
 
-fn runInsertTest(cases: []const InsertCase) !void {
-    const allocator = testing.allocator;
-    var router = lib.Router([]const u8).init(allocator);
-    defer router.deinit();
+fn insertOwnedBytesOk(
+    allocator: Allocator,
+    router: *lib.Router([]u8),
+    route: []const u8,
+    bytes: []const u8,
+) !void {
+    const buf = try allocator.alloc(u8, bytes.len);
+    errdefer allocator.free(buf);
+    @memcpy(buf, bytes);
 
-    for (cases) |case| {
-        const got = try router.insert(case.route, case.route);
-        try expectInsertResult(allocator, got, case.expected);
+    switch (try router.insert(route, buf)) {
+        .ok => {},
+        .err => |err_val| {
+            var err = err_val;
+            defer err.deinit(allocator);
+            return error.UnexpectedInsertError;
+        },
     }
+}
+
+fn runInsertTest(cases: []const InsertCase) !void {
+    try withGpa(cases, struct {
+        fn run(cases_inner: []const InsertCase, allocator: Allocator) !void {
+            var router = lib.Router([]const u8).init(allocator);
+            defer router.deinit();
+
+            for (cases_inner) |case| {
+                const got = try router.insert(case.route, case.route);
+                try expectInsertResult(allocator, got, case.expected);
+            }
+        }
+    }.run);
 }
 
 const ParamPair = struct {
@@ -426,58 +470,67 @@ fn expectParam(params_actual: *const lib.Params, key: []const u8, expected: ?[]c
 }
 
 fn runMatchTest(routes: []const []const u8, cases: []const MatchCase) !void {
-    const allocator = testing.allocator;
-    var router = lib.Router([]u8).init(allocator);
-    defer router.deinit();
+    const Ctx = struct {
+        routes: []const []const u8,
+        cases: []const MatchCase,
+    };
 
-    var values = std.ArrayListUnmanaged([]u8){};
-    defer {
-        for (values.items) |buf| allocator.free(buf);
-        values.deinit(allocator);
-    }
+    const ctx = Ctx{ .routes = routes, .cases = cases };
+    try withGpa(ctx, struct {
+        fn run(ctx_inner: Ctx, allocator: Allocator) !void {
+            var router = lib.Router([]u8).init(allocator);
+            defer router.deinit();
 
-    for (routes) |route| {
-        const buf = try allocator.alloc(u8, route.len);
-        @memcpy(buf, route);
-        try values.append(allocator, buf);
-        const insert_err = try router.insert(route, buf);
-        try expectInsertOk(allocator, insert_err);
-    }
-
-    for (cases) |case| {
-        if (router.match(case.path)) |match_val| {
-            var match = match_val;
-            defer match.deinit();
-            switch (case.params) {
-                .err => try testing.expect(false),
-                .ok => |expected_pairs| {
-                    try testing.expect(std.mem.eql(u8, match.value.*, case.route));
-                    try expectParams(&match.params, expected_pairs);
-
-                    var mut_match = try router.matchMut(case.path);
-                    defer mut_match.deinit();
-                    if (mut_match.value.*.len > 0) {
-                        const original = mut_match.value.*[0];
-                        mut_match.value.*[0] = 'Z';
-
-                        var check = try router.match(case.path);
-                        defer check.deinit();
-                        try testing.expect(check.value.*.len > 0);
-                        try testing.expectEqual(@as(u8, 'Z'), check.value.*[0]);
-
-                        var restore = try router.matchMut(case.path);
-                        restore.value.*[0] = original;
-                        restore.deinit();
-                    }
-                },
+            var values = std.ArrayListUnmanaged([]u8){};
+            defer {
+                for (values.items) |buf| allocator.free(buf);
+                values.deinit(allocator);
             }
-        } else |err| {
-            switch (case.params) {
-                .err => try testing.expect(err == error.NotFound),
-                .ok => try testing.expect(false),
+
+            for (ctx_inner.routes) |route| {
+                const buf = try allocator.alloc(u8, route.len);
+                @memcpy(buf, route);
+                try values.append(allocator, buf);
+                const insert_err = try router.insert(route, buf);
+                try expectInsertOk(allocator, insert_err);
+            }
+
+            for (ctx_inner.cases) |case| {
+                if (router.match(case.path)) |match_val| {
+                    var match = match_val;
+                    defer match.deinit();
+                    switch (case.params) {
+                        .err => try testing.expect(false),
+                        .ok => |expected_pairs| {
+                            try testing.expect(std.mem.eql(u8, match.value.*, case.route));
+                            try expectParams(&match.params, expected_pairs);
+
+                            var mut_match = try router.matchMut(case.path);
+                            defer mut_match.deinit();
+                            if (mut_match.value.*.len > 0) {
+                                const original = mut_match.value.*[0];
+                                mut_match.value.*[0] = 'Z';
+
+                                var check = try router.match(case.path);
+                                defer check.deinit();
+                                try testing.expect(check.value.*.len > 0);
+                                try testing.expectEqual(@as(u8, 'Z'), check.value.*[0]);
+
+                                var restore = try router.matchMut(case.path);
+                                restore.value.*[0] = original;
+                                restore.deinit();
+                            }
+                        },
+                    }
+                } else |err| {
+                    switch (case.params) {
+                        .err => try testing.expect(err == error.NotFound),
+                        .ok => try testing.expect(false),
+                    }
+                }
             }
         }
-    }
+    }.run);
 }
 
 const Operation = enum {
@@ -508,32 +561,42 @@ fn runRemoveTest(
     ops: []const RemoveCase,
     remaining: []const []const u8,
 ) !void {
-    const allocator = testing.allocator;
-    var router = lib.Router([]const u8).init(allocator);
-    defer router.deinit();
+    const Ctx = struct {
+        routes: []const []const u8,
+        ops: []const RemoveCase,
+        remaining: []const []const u8,
+    };
 
-    for (routes) |route| {
-        const insert_err = try router.insert(route, route);
-        try expectInsertOk(allocator, insert_err);
-    }
+    const ctx = Ctx{ .routes = routes, .ops = ops, .remaining = remaining };
+    try withGpa(ctx, struct {
+        fn run(ctx_inner: Ctx, allocator: Allocator) !void {
+            var router = lib.Router([]const u8).init(allocator);
+            defer router.deinit();
 
-    for (ops) |op| {
-        switch (op.op) {
-            .insert => {
-                const insert_err = try router.insert(op.route, op.route);
+            for (ctx_inner.routes) |route| {
+                const insert_err = try router.insert(route, route);
                 try expectInsertOk(allocator, insert_err);
-            },
-            .remove => {
-                const got = try router.remove(op.route);
-                try expectOptionalSlice(op.expected, got);
-            },
-        }
-    }
+            }
 
-    for (remaining) |route| {
-        var match = try router.match(route);
-        match.deinit();
-    }
+            for (ctx_inner.ops) |op| {
+                switch (op.op) {
+                    .insert => {
+                        const insert_err = try router.insert(op.route, op.route);
+                        try expectInsertOk(allocator, insert_err);
+                    },
+                    .remove => {
+                        const got = try router.remove(op.route);
+                        try expectOptionalSlice(op.expected, got);
+                    },
+                }
+            }
+
+            for (ctx_inner.remaining) |route| {
+                var match = try router.match(route);
+                match.deinit();
+            }
+        }
+    }.run);
 }
 
 test "missing leading slash suffix" {
@@ -548,22 +611,25 @@ test "missing leading slash suffix" {
 }
 
 test "param suffix and non-suffix nodes" {
-    const allocator = testing.allocator;
-    var router = lib.Router([]const u8).init(allocator);
-    defer router.deinit();
+    try withGpa({}, struct {
+        fn run(_: void, allocator: Allocator) !void {
+            var router = lib.Router([]const u8).init(allocator);
+            defer router.deinit();
 
-    try expectInsertOk(allocator, try router.insert("/with/{id}suffix", "suffix"));
-    try expectInsertOk(allocator, try router.insert("/plain/{id}", "plain"));
+            try expectInsertOk(allocator, try router.insert("/with/{id}suffix", "suffix"));
+            try expectInsertOk(allocator, try router.insert("/plain/{id}", "plain"));
 
-    var match_suffix = try router.match("/with/123suffix");
-    defer match_suffix.deinit();
-    try testing.expect(std.mem.eql(u8, match_suffix.value.*, "suffix"));
-    try expectParam(&match_suffix.params, "id", "123");
+            var match_suffix = try router.match("/with/123suffix");
+            defer match_suffix.deinit();
+            try testing.expect(std.mem.eql(u8, match_suffix.value.*, "suffix"));
+            try expectParam(&match_suffix.params, "id", "123");
 
-    var match_plain = try router.match("/plain/456");
-    defer match_plain.deinit();
-    try testing.expect(std.mem.eql(u8, match_plain.value.*, "plain"));
-    try expectParam(&match_plain.params, "id", "456");
+            var match_plain = try router.match("/plain/456");
+            defer match_plain.deinit();
+            try testing.expect(std.mem.eql(u8, match_plain.value.*, "plain"));
+            try expectParam(&match_plain.params, "id", "456");
+        }
+    }.run);
 }
 
 test "missing leading slash conflict" {
@@ -849,57 +915,66 @@ test "double params" {
 }
 
 test "too many params" {
-    const allocator = testing.allocator;
-    var router = lib.Router([]const u8).init(allocator);
-    defer router.deinit();
+    try withGpa({}, struct {
+        fn run(_: void, allocator: Allocator) !void {
+            var router = lib.Router([]const u8).init(allocator);
+            defer router.deinit();
 
-    var buf = std.ArrayListUnmanaged(u8){};
-    defer buf.deinit(allocator);
+            var buf = std.ArrayListUnmanaged(u8){};
+            defer buf.deinit(allocator);
 
-    const max_params: usize = @as(usize, 'z' - 'a' + 1);
-    try buf.append(allocator, '/');
-    var i: usize = 0;
-    while (i < max_params + 1) : (i += 1) {
-        if (i > 0) try buf.append(allocator, '/');
-        try buf.append(allocator, '{');
-        var name_buf: [8]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buf, "p{d}", .{i});
-        try buf.appendSlice(allocator, name);
-        try buf.append(allocator, '}');
-    }
+            const max_params: usize = @as(usize, 'z' - 'a' + 1);
+            try buf.append(allocator, '/');
+            var i: usize = 0;
+            while (i < max_params + 1) : (i += 1) {
+                if (i > 0) try buf.append(allocator, '/');
+                try buf.append(allocator, '{');
+                var name_buf: [8]u8 = undefined;
+                const name = try std.fmt.bufPrint(&name_buf, "p{d}", .{i});
+                try buf.appendSlice(allocator, name);
+                try buf.append(allocator, '}');
+            }
 
-    const got = try router.insert(buf.items, buf.items);
-    try expectInsertResult(allocator, got, .too_many_params);
+            const got = try router.insert(buf.items, buf.items);
+            try expectInsertResult(allocator, got, .too_many_params);
+        }
+    }.run);
 }
 
 test "invalid insert preserves existing routes" {
-    const allocator = testing.allocator;
-    var router = lib.Router([]const u8).init(allocator);
-    defer router.deinit();
+    try withGpa({}, struct {
+        fn run(_: void, allocator: Allocator) !void {
+            var router = lib.Router([]const u8).init(allocator);
+            defer router.deinit();
 
-    try expectInsertOk(allocator, try router.insert("/foo/{id}", "ok"));
-    const got = try router.insert("/{a}{b}", "bad");
-    try expectInsertResult(allocator, got, .invalid_param_segment);
+            try expectInsertOk(allocator, try router.insert("/foo/{id}", "ok"));
+            const got = try router.insert("/{a}{b}", "bad");
+            try expectInsertResult(allocator, got, .invalid_param_segment);
 
-    var match = try router.match("/foo/123");
-    defer match.deinit();
-    try testing.expect(std.mem.eql(u8, match.value.*, "ok"));
-    try expectParam(&match.params, "id", "123");
+            var match = try router.match("/foo/123");
+            defer match.deinit();
+            try testing.expect(std.mem.eql(u8, match.value.*, "ok"));
+            try expectParam(&match.params, "id", "123");
+        }
+    }.run);
 }
 
 test "invalid catchall preserves existing routes" {
-    const allocator = testing.allocator;
-    var router = lib.Router([]const u8).init(allocator);
-    defer router.deinit();
+    try withGpa({}, struct {
+        fn run(_: void, allocator: Allocator) !void {
+            var router = lib.Router([]const u8).init(allocator);
+            defer router.deinit();
 
-    try expectInsertOk(allocator, try router.insert("/foo/{id}", "ok"));
-    const got = try router.insert("/{*a}x", "bad");
-    try expectInsertResult(allocator, got, .invalid_catch_all);
+            try expectInsertOk(allocator, try router.insert("/foo/{id}", "ok"));
+            const got = try router.insert("/{*a}x", "bad");
+            try expectInsertResult(allocator, got, .invalid_catch_all);
 
-    var match = try router.match("/foo/123");
-    defer match.deinit();
-    try testing.expect(std.mem.eql(u8, match.value.*, "ok"));
-    try expectParam(&match.params, "id", "123");
+            var match = try router.match("/foo/123");
+            defer match.deinit();
+            try testing.expect(std.mem.eql(u8, match.value.*, "ok"));
+            try expectParam(&match.params, "id", "123");
+        }
+    }.run);
 }
 
 test "normalized conflict" {
@@ -1003,105 +1078,114 @@ test "bare catchall" {
 }
 
 test "partial overlap" {
-    const allocator = testing.allocator;
-    {
-        var router = lib.Router([]const u8).init(allocator);
-        defer router.deinit();
-        try expectInsertOk(allocator, try router.insert("/foo_bar", "Welcome!"));
-        try expectInsertOk(allocator, try router.insert("/foo/bar", "Welcome!"));
-        try testing.expectError(error.NotFound, router.match("/foo/"));
-    }
-    {
-        var router = lib.Router([]const u8).init(allocator);
-        defer router.deinit();
-        try expectInsertOk(allocator, try router.insert("/foo", "Welcome!"));
-        try expectInsertOk(allocator, try router.insert("/foo/bar", "Welcome!"));
-        try testing.expectError(error.NotFound, router.match("/foo/"));
-    }
+    try withGpa({}, struct {
+        fn run(_: void, allocator: Allocator) !void {
+            {
+                var router = lib.Router([]const u8).init(allocator);
+                defer router.deinit();
+                try expectInsertOk(allocator, try router.insert("/foo_bar", "Welcome!"));
+                try expectInsertOk(allocator, try router.insert("/foo/bar", "Welcome!"));
+                try testing.expectError(error.NotFound, router.match("/foo/"));
+            }
+            {
+                var router = lib.Router([]const u8).init(allocator);
+                defer router.deinit();
+                try expectInsertOk(allocator, try router.insert("/foo", "Welcome!"));
+                try expectInsertOk(allocator, try router.insert("/foo/bar", "Welcome!"));
+                try testing.expectError(error.NotFound, router.match("/foo/"));
+            }
+        }
+    }.run);
 }
 
 test "wildcard overlap" {
-    const allocator = testing.allocator;
-    {
-        var router = lib.Router([]const u8).init(allocator);
-        defer router.deinit();
-        try expectInsertOk(allocator, try router.insert("/path/foo", "foo"));
-        try expectInsertOk(allocator, try router.insert("/path/{*rest}", "wildcard"));
+    try withGpa({}, struct {
+        fn run(_: void, allocator: Allocator) !void {
+            {
+                var router = lib.Router([]const u8).init(allocator);
+                defer router.deinit();
+                try expectInsertOk(allocator, try router.insert("/path/foo", "foo"));
+                try expectInsertOk(allocator, try router.insert("/path/{*rest}", "wildcard"));
 
-        {
-            var match = try router.match("/path/foo");
-            defer match.deinit();
-            try testing.expect(std.mem.eql(u8, match.value.*, "foo"));
+                {
+                    var match = try router.match("/path/foo");
+                    defer match.deinit();
+                    try testing.expect(std.mem.eql(u8, match.value.*, "foo"));
+                }
+
+                {
+                    var match = try router.match("/path/bar");
+                    defer match.deinit();
+                    try testing.expect(std.mem.eql(u8, match.value.*, "wildcard"));
+                }
+
+                {
+                    var match = try router.match("/path/foo/");
+                    defer match.deinit();
+                    try testing.expect(std.mem.eql(u8, match.value.*, "wildcard"));
+                }
+            }
+
+            {
+                var router = lib.Router([]const u8).init(allocator);
+                defer router.deinit();
+                try expectInsertOk(allocator, try router.insert("/path/foo/{arg}", "foo"));
+                try expectInsertOk(allocator, try router.insert("/path/{*rest}", "wildcard"));
+
+                {
+                    var match = try router.match("/path/foo/myarg");
+                    defer match.deinit();
+                    try testing.expect(std.mem.eql(u8, match.value.*, "foo"));
+                }
+
+                {
+                    var match = try router.match("/path/foo/myarg/");
+                    defer match.deinit();
+                    try testing.expect(std.mem.eql(u8, match.value.*, "wildcard"));
+                }
+
+                {
+                    var match = try router.match("/path/foo/myarg/bar/baz");
+                    defer match.deinit();
+                    try testing.expect(std.mem.eql(u8, match.value.*, "wildcard"));
+                }
+            }
         }
-
-        {
-            var match = try router.match("/path/bar");
-            defer match.deinit();
-            try testing.expect(std.mem.eql(u8, match.value.*, "wildcard"));
-        }
-
-        {
-            var match = try router.match("/path/foo/");
-            defer match.deinit();
-            try testing.expect(std.mem.eql(u8, match.value.*, "wildcard"));
-        }
-    }
-
-    {
-        var router = lib.Router([]const u8).init(allocator);
-        defer router.deinit();
-        try expectInsertOk(allocator, try router.insert("/path/foo/{arg}", "foo"));
-        try expectInsertOk(allocator, try router.insert("/path/{*rest}", "wildcard"));
-
-        {
-            var match = try router.match("/path/foo/myarg");
-            defer match.deinit();
-            try testing.expect(std.mem.eql(u8, match.value.*, "foo"));
-        }
-
-        {
-            var match = try router.match("/path/foo/myarg/");
-            defer match.deinit();
-            try testing.expect(std.mem.eql(u8, match.value.*, "wildcard"));
-        }
-
-        {
-            var match = try router.match("/path/foo/myarg/bar/baz");
-            defer match.deinit();
-            try testing.expect(std.mem.eql(u8, match.value.*, "wildcard"));
-        }
-    }
+    }.run);
 }
 
 test "overlapping param backtracking" {
-    const allocator = testing.allocator;
-    var matcher = lib.Router([]const u8).init(allocator);
-    defer matcher.deinit();
+    try withGpa({}, struct {
+        fn run(_: void, allocator: Allocator) !void {
+            var matcher = lib.Router([]const u8).init(allocator);
+            defer matcher.deinit();
 
-    try expectInsertOk(allocator, try matcher.insert("/{object}/{id}", "object with id"));
-    try expectInsertOk(
-        allocator,
-        try matcher.insert("/secret/{id}/path", "secret with id and path"),
-    );
+            try expectInsertOk(allocator, try matcher.insert("/{object}/{id}", "object with id"));
+            try expectInsertOk(
+                allocator,
+                try matcher.insert("/secret/{id}/path", "secret with id and path"),
+            );
 
-    {
-        var matched = try matcher.match("/secret/978/path");
-        defer matched.deinit();
-        try expectParam(&matched.params, "id", "978");
-    }
+            {
+                var matched = try matcher.match("/secret/978/path");
+                defer matched.deinit();
+                try expectParam(&matched.params, "id", "978");
+            }
 
-    {
-        var matched = try matcher.match("/something/978");
-        defer matched.deinit();
-        try expectParam(&matched.params, "id", "978");
-        try expectParam(&matched.params, "object", "something");
-    }
+            {
+                var matched = try matcher.match("/something/978");
+                defer matched.deinit();
+                try expectParam(&matched.params, "id", "978");
+                try expectParam(&matched.params, "object", "something");
+            }
 
-    {
-        var matched = try matcher.match("/secret/978");
-        defer matched.deinit();
-        try expectParam(&matched.params, "id", "978");
-    }
+            {
+                var matched = try matcher.match("/secret/978");
+                defer matched.deinit();
+                try expectParam(&matched.params, "id", "978");
+            }
+        }
+    }.run);
 }
 
 test "empty route" {
@@ -2566,19 +2650,22 @@ test "remove escaped params" {
 }
 
 test "remove escaped literal" {
-    const allocator = testing.allocator;
-    var router = lib.Router([]const u8).init(allocator);
-    defer router.deinit();
+    try withGpa({}, struct {
+        fn run(_: void, allocator: Allocator) !void {
+            var router = lib.Router([]const u8).init(allocator);
+            defer router.deinit();
 
-    try expectInsertOk(allocator, try router.insert("/foo/{a}", "/foo/{a}"));
-    try expectInsertOk(allocator, try router.insert("/foo/{{a}}", "/foo/{{a}}"));
+            try expectInsertOk(allocator, try router.insert("/foo/{a}", "/foo/{a}"));
+            try expectInsertOk(allocator, try router.insert("/foo/{{a}}", "/foo/{{a}}"));
 
-    const removed = try router.remove("/foo/{a}");
-    try expectOptionalSlice("/foo/{a}", removed);
+            const removed = try router.remove("/foo/{a}");
+            try expectOptionalSlice("/foo/{a}", removed);
 
-    var match = try router.match("/foo/{a}");
-    defer match.deinit();
-    try testing.expect(std.mem.eql(u8, match.value.*, "/foo/{{a}}"));
+            var match = try router.match("/foo/{a}");
+            defer match.deinit();
+            try testing.expect(std.mem.eql(u8, match.value.*, "/foo/{{a}}"));
+        }
+    }.run);
 }
 
 test "remove wildcard suffix" {
@@ -2614,213 +2701,771 @@ test "remove wildcard suffix" {
 }
 
 test "merge ok" {
-    const allocator = testing.allocator;
-    var root = lib.Router([]const u8).init(allocator);
-    defer root.deinit();
-    try expectInsertOk(allocator, try root.insert("/foo", "foo"));
-    try expectInsertOk(allocator, try root.insert("/bar/{id}", "bar"));
+    try withGpa({}, struct {
+        fn run(_: void, allocator: Allocator) !void {
+            var root = lib.Router([]const u8).init(allocator);
+            defer root.deinit();
+            try expectInsertOk(allocator, try root.insert("/foo", "foo"));
+            try expectInsertOk(allocator, try root.insert("/bar/{id}", "bar"));
 
-    var child = lib.Router([]const u8).init(allocator);
-    defer child.deinit();
-    try expectInsertOk(allocator, try child.insert("/baz", "baz"));
-    try expectInsertOk(allocator, try child.insert("/xyz/{id}", "xyz"));
+            var child = lib.Router([]const u8).init(allocator);
+            defer child.deinit();
+            try expectInsertOk(allocator, try child.insert("/baz", "baz"));
+            try expectInsertOk(allocator, try child.insert("/xyz/{id}", "xyz"));
 
-    switch (try root.mergeFrom(&child)) {
-        .ok => {},
-        .err => |err_val| {
-            var err = err_val;
-            defer err.deinit(allocator);
-            try testing.expect(false);
-        },
-    }
+            switch (try root.mergeFrom(&child)) {
+                .ok => {},
+                .err => |err_val| {
+                    var err = err_val;
+                    defer err.deinit(allocator);
+                    try testing.expect(false);
+                },
+            }
 
-    var match_foo = try root.match("/foo");
-    defer match_foo.deinit();
-    try testing.expect(std.mem.eql(u8, match_foo.value.*, "foo"));
+            var match_foo = try root.match("/foo");
+            defer match_foo.deinit();
+            try testing.expect(std.mem.eql(u8, match_foo.value.*, "foo"));
 
-    var match_bar = try root.match("/bar/1");
-    defer match_bar.deinit();
-    try testing.expect(std.mem.eql(u8, match_bar.value.*, "bar"));
+            var match_bar = try root.match("/bar/1");
+            defer match_bar.deinit();
+            try testing.expect(std.mem.eql(u8, match_bar.value.*, "bar"));
 
-    var match_baz = try root.match("/baz");
-    defer match_baz.deinit();
-    try testing.expect(std.mem.eql(u8, match_baz.value.*, "baz"));
+            var match_baz = try root.match("/baz");
+            defer match_baz.deinit();
+            try testing.expect(std.mem.eql(u8, match_baz.value.*, "baz"));
 
-    var match_xyz = try root.match("/xyz/2");
-    defer match_xyz.deinit();
-    try testing.expect(std.mem.eql(u8, match_xyz.value.*, "xyz"));
+            var match_xyz = try root.match("/xyz/2");
+            defer match_xyz.deinit();
+            try testing.expect(std.mem.eql(u8, match_xyz.value.*, "xyz"));
+        }
+    }.run);
+}
+
+test "mergeFrom preserves escaped braces semantics" {
+    try withGpa({}, struct {
+        fn run(_: void, allocator: Allocator) !void {
+            var root = lib.Router([]const u8).init(allocator);
+            defer root.deinit();
+
+            var child = lib.Router([]const u8).init(allocator);
+            defer child.deinit();
+
+            try expectInsertOk(allocator, try child.insert("/literal/{{braces}}", "ok"));
+
+            switch (try root.mergeFrom(&child)) {
+                .ok => {},
+                .err => |err_val| {
+                    var err = err_val;
+                    defer err.deinit(allocator);
+                    try testing.expect(false);
+                },
+            }
+
+            var match = try root.match("/literal/{braces}");
+            defer match.deinit();
+
+            try testing.expectEqualStrings("ok", match.value.*);
+            try testing.expectEqual(@as(usize, 0), match.params.len());
+
+            try testing.expectError(error.NotFound, root.match("/literal/xyz"));
+        }
+    }.run);
 }
 
 test "merge conflict" {
-    const allocator = testing.allocator;
-    var root = lib.Router([]const u8).init(allocator);
-    defer root.deinit();
-    try expectInsertOk(allocator, try root.insert("/foo", "foo"));
-    try expectInsertOk(allocator, try root.insert("/bar", "bar"));
+    try withGpa({}, struct {
+        fn run(_: void, allocator: Allocator) !void {
+            var root = lib.Router([]const u8).init(allocator);
+            defer root.deinit();
+            try expectInsertOk(allocator, try root.insert("/foo", "foo"));
+            try expectInsertOk(allocator, try root.insert("/bar", "bar"));
 
-    var child = lib.Router([]const u8).init(allocator);
-    defer child.deinit();
-    try expectInsertOk(allocator, try child.insert("/foo", "changed"));
-    try expectInsertOk(allocator, try child.insert("/bar", "changed"));
-    try expectInsertOk(allocator, try child.insert("/baz", "baz"));
+            var child = lib.Router([]const u8).init(allocator);
+            defer child.deinit();
+            try expectInsertOk(allocator, try child.insert("/foo", "changed"));
+            try expectInsertOk(allocator, try child.insert("/bar", "changed"));
+            try expectInsertOk(allocator, try child.insert("/baz", "baz"));
 
-    switch (try root.mergeFrom(&child)) {
-        .ok => try testing.expect(false),
-        .err => |err_val| {
-            var err = err_val;
-            defer err.deinit(allocator);
+            switch (try root.mergeFrom(&child)) {
+                .ok => try testing.expect(false),
+                .err => |err_val| {
+                    var err = err_val;
+                    defer err.deinit(allocator);
 
-            try testing.expectEqual(@as(usize, 2), err.errors.items.len);
-            switch (err.errors.items[0]) {
-                .Conflict => |route| try testing.expect(std.mem.eql(u8, route.slice(), "/foo")),
-                else => try testing.expect(false),
+                    try testing.expectEqual(@as(usize, 2), err.errors.items.len);
+                    switch (err.errors.items[0]) {
+                        .Conflict => |route| try testing.expect(std.mem.eql(u8, route.slice(), "/foo")),
+                        else => try testing.expect(false),
+                    }
+                    switch (err.errors.items[1]) {
+                        .Conflict => |route| try testing.expect(std.mem.eql(u8, route.slice(), "/bar")),
+                        else => try testing.expect(false),
+                    }
+                },
             }
-            switch (err.errors.items[1]) {
-                .Conflict => |route| try testing.expect(std.mem.eql(u8, route.slice(), "/bar")),
-                else => try testing.expect(false),
+
+            var match_foo = try root.match("/foo");
+            defer match_foo.deinit();
+            try testing.expect(std.mem.eql(u8, match_foo.value.*, "foo"));
+
+            var match_bar = try root.match("/bar");
+            defer match_bar.deinit();
+            try testing.expect(std.mem.eql(u8, match_bar.value.*, "bar"));
+
+            var match_baz = try root.match("/baz");
+            defer match_baz.deinit();
+            try testing.expect(std.mem.eql(u8, match_baz.value.*, "baz"));
+        }
+    }.run);
+}
+
+test "mergeFrom conflict must not discard values (leak check)" {
+    try withGpa({}, struct {
+        fn run(_: void, allocator: Allocator) !void {
+            var root = lib.Router([]u8).init(allocator);
+            defer root.deinit();
+
+            var child = lib.Router([]u8).init(allocator);
+            defer child.deinit();
+
+            // Root already has /foo (so child's /foo will conflict).
+            try insertOwnedBytesOk(allocator, &root, "/foo", "root");
+
+            // Child has conflicting /foo plus a non-conflicting /baz.
+            try insertOwnedBytesOk(allocator, &child, "/foo", "child_conflict");
+            try insertOwnedBytesOk(allocator, &child, "/baz", "child_ok");
+
+            const res = try root.mergeFrom(&child);
+            switch (res) {
+                .ok => return error.ExpectedMergeConflict,
+                .err => |err_val| {
+                    var err = err_val;
+                    defer err.deinit(allocator);
+                },
             }
-        },
-    }
 
-    var match_foo = try root.match("/foo");
-    defer match_foo.deinit();
-    try testing.expect(std.mem.eql(u8, match_foo.value.*, "foo"));
+            if (try root.remove("/baz")) |moved| allocator.free(moved) else return error.ExpectedBazMoved;
+            if (try root.remove("/foo")) |root_val| allocator.free(root_val) else return error.ExpectedRootFooPresent;
 
-    var match_bar = try root.match("/bar");
-    defer match_bar.deinit();
-    try testing.expect(std.mem.eql(u8, match_bar.value.*, "bar"));
+            if (try child.remove("/foo")) |conflict_val| {
+                allocator.free(conflict_val);
+            } else {
+                return error.ConflictValueLost;
+            }
 
-    var match_baz = try root.match("/baz");
-    defer match_baz.deinit();
-    try testing.expect(std.mem.eql(u8, match_baz.value.*, "baz"));
+            try testing.expect(try child.remove("/baz") == null);
+        }
+    }.run);
 }
 
 test "merge nested" {
-    const allocator = testing.allocator;
-    var root = lib.Router([]const u8).init(allocator);
-    defer root.deinit();
-    try expectInsertOk(allocator, try root.insert("/foo", "foo"));
+    try withGpa({}, struct {
+        fn run(_: void, allocator: Allocator) !void {
+            var root = lib.Router([]const u8).init(allocator);
+            defer root.deinit();
+            try expectInsertOk(allocator, try root.insert("/foo", "foo"));
 
-    var child = lib.Router([]const u8).init(allocator);
-    defer child.deinit();
-    try expectInsertOk(allocator, try child.insert("/foo/bar", "bar"));
+            var child = lib.Router([]const u8).init(allocator);
+            defer child.deinit();
+            try expectInsertOk(allocator, try child.insert("/foo/bar", "bar"));
 
-    switch (try root.mergeFrom(&child)) {
-        .ok => {},
-        .err => |err_val| {
-            var err = err_val;
-            defer err.deinit(allocator);
-            try testing.expect(false);
-        },
-    }
+            switch (try root.mergeFrom(&child)) {
+                .ok => {},
+                .err => |err_val| {
+                    var err = err_val;
+                    defer err.deinit(allocator);
+                    try testing.expect(false);
+                },
+            }
 
-    var match_foo = try root.match("/foo");
-    defer match_foo.deinit();
-    try testing.expect(std.mem.eql(u8, match_foo.value.*, "foo"));
+            var match_foo = try root.match("/foo");
+            defer match_foo.deinit();
+            try testing.expect(std.mem.eql(u8, match_foo.value.*, "foo"));
 
-    var match_bar = try root.match("/foo/bar");
-    defer match_bar.deinit();
-    try testing.expect(std.mem.eql(u8, match_bar.value.*, "bar"));
+            var match_bar = try root.match("/foo/bar");
+            defer match_bar.deinit();
+            try testing.expect(std.mem.eql(u8, match_bar.value.*, "bar"));
+        }
+    }.run);
+}
+
+test "param remapping sanity" {
+    try withGpa({}, struct {
+        fn run(_: void, allocator: Allocator) !void {
+            var router = lib.Router([]const u8).init(allocator);
+            defer router.deinit();
+
+            try expectInsertOk(allocator, try router.insert("/a/{id}/{name}/{x}/{y}", "ok"));
+
+            var match = try router.match("/a/1/2/3/4");
+            defer match.deinit();
+
+            try testing.expect(match.params.get("") == null);
+            try testing.expectEqual(@as(usize, 4), match.params.len());
+            try expectParams(&match.params, &[_]ParamPair{
+                .{ .key = "id", .value = "1" },
+                .{ .key = "name", .value = "2" },
+                .{ .key = "x", .value = "3" },
+                .{ .key = "y", .value = "4" },
+            });
+        }
+    }.run);
+}
+
+test "oom insert split preserves routes" {
+    try checkAllOomPoints(struct {
+        fn run(allocator: Allocator) !void {
+            var router = lib.Router([]const u8).init(allocator);
+            defer router.deinit();
+
+            const first = router.insert("/foo/bar", "bar") catch |err| switch (err) {
+                error.OutOfMemory => {
+                    router.verify();
+                    return error.OutOfMemory;
+                },
+                else => return err,
+            };
+            try expectInsertOk(allocator, first);
+
+            const second = router.insert("/foo/baz", "baz") catch |err| switch (err) {
+                error.OutOfMemory => {
+                    router.verify();
+                    var match = try router.match("/foo/bar");
+                    defer match.deinit();
+                    try testing.expect(std.mem.eql(u8, match.value.*, "bar"));
+                    return error.OutOfMemory;
+                },
+                else => return err,
+            };
+            try expectInsertOk(allocator, second);
+
+            router.verify();
+
+            var match_bar = try router.match("/foo/bar");
+            defer match_bar.deinit();
+            try testing.expect(std.mem.eql(u8, match_bar.value.*, "bar"));
+
+            var match_baz = try router.match("/foo/baz");
+            defer match_baz.deinit();
+            try testing.expect(std.mem.eql(u8, match_baz.value.*, "baz"));
+        }
+    }.run, .{});
+}
+
+test "oom insert param suffix preserves routes" {
+    try checkAllOomPoints(struct {
+        fn run(allocator: Allocator) !void {
+            var router = lib.Router([]const u8).init(allocator);
+            defer router.deinit();
+
+            const first = router.insert("/files/{name}.txt", "txt") catch |err| switch (err) {
+                error.OutOfMemory => {
+                    router.verify();
+                    return error.OutOfMemory;
+                },
+                else => return err,
+            };
+            try expectInsertOk(allocator, first);
+
+            var match_txt = try router.match("/files/readme.txt");
+            defer match_txt.deinit();
+            try testing.expect(std.mem.eql(u8, match_txt.value.*, "txt"));
+            try expectParam(&match_txt.params, "name", "readme");
+
+            const second = router.insert("/files/{name}.json", "json") catch |err| switch (err) {
+                error.OutOfMemory => {
+                    router.verify();
+                    var match = try router.match("/files/readme.txt");
+                    defer match.deinit();
+                    try testing.expect(std.mem.eql(u8, match.value.*, "txt"));
+                    return error.OutOfMemory;
+                },
+                else => return err,
+            };
+            try expectInsertOk(allocator, second);
+
+            var match_json = try router.match("/files/data.json");
+            defer match_json.deinit();
+            try testing.expect(std.mem.eql(u8, match_json.value.*, "json"));
+            try expectParam(&match_json.params, "name", "data");
+
+            const third = router.insert("/files/static.txt", "static") catch |err| switch (err) {
+                error.OutOfMemory => {
+                    router.verify();
+                    var match = try router.match("/files/readme.txt");
+                    defer match.deinit();
+                    try testing.expect(std.mem.eql(u8, match.value.*, "txt"));
+                    return error.OutOfMemory;
+                },
+                else => return err,
+            };
+            try expectInsertOk(allocator, third);
+
+            router.verify();
+
+            var match_txt2 = try router.match("/files/readme.txt");
+            defer match_txt2.deinit();
+            try testing.expect(std.mem.eql(u8, match_txt2.value.*, "txt"));
+
+            var match_json2 = try router.match("/files/data.json");
+            defer match_json2.deinit();
+            try testing.expect(std.mem.eql(u8, match_json2.value.*, "json"));
+        }
+    }.run, .{});
+}
+
+test "oom insert catchall preserves routes" {
+    try checkAllOomPoints(struct {
+        fn run(allocator: Allocator) !void {
+            var router = lib.Router([]const u8).init(allocator);
+            defer router.deinit();
+
+            const first = router.insert("/health", "ok") catch |err| switch (err) {
+                error.OutOfMemory => {
+                    router.verify();
+                    return error.OutOfMemory;
+                },
+                else => return err,
+            };
+            try expectInsertOk(allocator, first);
+
+            const second = router.insert("/static/{*path}", "static") catch |err| switch (err) {
+                error.OutOfMemory => {
+                    router.verify();
+                    var match = try router.match("/health");
+                    defer match.deinit();
+                    try testing.expect(std.mem.eql(u8, match.value.*, "ok"));
+                    return error.OutOfMemory;
+                },
+                else => return err,
+            };
+            try expectInsertOk(allocator, second);
+
+            router.verify();
+
+            var match_health = try router.match("/health");
+            defer match_health.deinit();
+            try testing.expect(std.mem.eql(u8, match_health.value.*, "ok"));
+
+            var match_static = try router.match("/static/css/app.css");
+            defer match_static.deinit();
+            try testing.expect(std.mem.eql(u8, match_static.value.*, "static"));
+            try expectParam(&match_static.params, "path", "css/app.css");
+        }
+    }.run, .{});
+}
+
+test "oom insert conflict preserves routes" {
+    try checkAllOomPoints(struct {
+        fn run(allocator: Allocator) !void {
+            var router = lib.Router([]const u8).init(allocator);
+            defer router.deinit();
+
+            const first = router.insert("/x/{a}/bar", "a") catch |err| switch (err) {
+                error.OutOfMemory => {
+                    router.verify();
+                    return error.OutOfMemory;
+                },
+                else => return err,
+            };
+            try expectInsertOk(allocator, first);
+
+            const second = router.insert("/x/{b}/bar", "b") catch |err| switch (err) {
+                error.OutOfMemory => {
+                    router.verify();
+                    var match = try router.match("/x/1/bar");
+                    defer match.deinit();
+                    try testing.expect(std.mem.eql(u8, match.value.*, "a"));
+                    try expectParam(&match.params, "a", "1");
+                    return error.OutOfMemory;
+                },
+                else => return err,
+            };
+            try expectInsertResult(allocator, second, .{ .conflict = "/x/{a}/bar" });
+
+            router.verify();
+
+            var match = try router.match("/x/1/bar");
+            defer match.deinit();
+            try testing.expect(std.mem.eql(u8, match.value.*, "a"));
+            try expectParam(&match.params, "a", "1");
+        }
+    }.run, .{});
+}
+
+test "oom match params grow preserves routes" {
+    try checkAllOomPoints(struct {
+        fn run(allocator: Allocator) !void {
+            var router = lib.Router([]const u8).init(allocator);
+            defer router.deinit();
+
+            const stable = router.insert("/stable", "stable") catch |err| switch (err) {
+                error.OutOfMemory => {
+                    router.verify();
+                    return error.OutOfMemory;
+                },
+                else => return err,
+            };
+            try expectInsertOk(allocator, stable);
+
+            const route = router.insert("/a/{p1}/{p2}/{p3}/{p4}", "many") catch |err| switch (err) {
+                error.OutOfMemory => {
+                    router.verify();
+                    var match = try router.match("/stable");
+                    defer match.deinit();
+                    try testing.expect(std.mem.eql(u8, match.value.*, "stable"));
+                    return error.OutOfMemory;
+                },
+                else => return err,
+            };
+            try expectInsertOk(allocator, route);
+
+            const match_result = router.match("/a/1/2/3/4") catch |err| switch (err) {
+                error.OutOfMemory => {
+                    router.verify();
+                    var match = try router.match("/stable");
+                    defer match.deinit();
+                    try testing.expect(std.mem.eql(u8, match.value.*, "stable"));
+                    return error.OutOfMemory;
+                },
+                else => return err,
+            };
+            var match_many = match_result;
+            defer match_many.deinit();
+            try testing.expect(std.mem.eql(u8, match_many.value.*, "many"));
+            try testing.expectEqual(@as(usize, 4), match_many.params.len());
+            try expectParam(&match_many.params, "p1", "1");
+            try expectParam(&match_many.params, "p4", "4");
+
+            router.verify();
+        }
+    }.run, .{});
+}
+
+test "oom match backtracking preserves routes" {
+    try checkAllOomPoints(struct {
+        fn run(allocator: Allocator) !void {
+            var router = lib.Router([]const u8).init(allocator);
+            defer router.deinit();
+
+            const first = router.insert("/{object}/{id}", "param") catch |err| switch (err) {
+                error.OutOfMemory => {
+                    router.verify();
+                    return error.OutOfMemory;
+                },
+                else => return err,
+            };
+            try expectInsertOk(allocator, first);
+
+            const second = router.insert("/secret/{id}/path", "secret") catch |err| switch (err) {
+                error.OutOfMemory => {
+                    router.verify();
+                    var match = try router.match("/zzz/123");
+                    defer match.deinit();
+                    try testing.expect(std.mem.eql(u8, match.value.*, "param"));
+                    try expectParam(&match.params, "object", "zzz");
+                    try expectParam(&match.params, "id", "123");
+                    return error.OutOfMemory;
+                },
+                else => return err,
+            };
+            try expectInsertOk(allocator, second);
+
+            const match_result = router.match("/secret/978/path") catch |err| switch (err) {
+                error.OutOfMemory => {
+                    router.verify();
+                    var match = try router.match("/zzz/123");
+                    defer match.deinit();
+                    try testing.expect(std.mem.eql(u8, match.value.*, "param"));
+                    try expectParam(&match.params, "object", "zzz");
+                    try expectParam(&match.params, "id", "123");
+                    return error.OutOfMemory;
+                },
+                else => return err,
+            };
+            var match_secret = match_result;
+            defer match_secret.deinit();
+            try testing.expect(std.mem.eql(u8, match_secret.value.*, "secret"));
+            try expectParam(&match_secret.params, "id", "978");
+
+            router.verify();
+        }
+    }.run, .{});
+}
+
+test "oom remove last route preserves routes" {
+    try checkAllOomPoints(struct {
+        fn run(allocator: Allocator) !void {
+            var router = lib.Router([]const u8).init(allocator);
+            defer router.deinit();
+
+            const insert_res = router.insert("/only", "/only") catch |err| switch (err) {
+                error.OutOfMemory => {
+                    router.verify();
+                    return error.OutOfMemory;
+                },
+                else => return err,
+            };
+            try expectInsertOk(allocator, insert_res);
+
+            const removed = router.remove("/only") catch |err| switch (err) {
+                error.OutOfMemory => {
+                    router.verify();
+                    var match = try router.match("/only");
+                    defer match.deinit();
+                    try testing.expect(std.mem.eql(u8, match.value.*, "/only"));
+                    return error.OutOfMemory;
+                },
+                else => return err,
+            };
+            try expectOptionalSlice("/only", removed);
+
+            router.verify();
+            try testing.expectError(error.NotFound, router.match("/only"));
+        }
+    }.run, .{});
+}
+
+test "oom remove wildcard suffix preserves routes" {
+    try checkAllOomPoints(struct {
+        fn run(allocator: Allocator) !void {
+            var router = lib.Router([]const u8).init(allocator);
+            defer router.deinit();
+
+            const insert_res = router.insert("/foo/{id}bar/baz", "suffix") catch |err| switch (err) {
+                error.OutOfMemory => {
+                    router.verify();
+                    return error.OutOfMemory;
+                },
+                else => return err,
+            };
+            try expectInsertOk(allocator, insert_res);
+
+            const removed = router.remove("/foo/{id}bar/baz") catch |err| switch (err) {
+                error.OutOfMemory => {
+                    router.verify();
+                    var match = try router.match("/foo/123bar/baz");
+                    defer match.deinit();
+                    try testing.expect(std.mem.eql(u8, match.value.*, "suffix"));
+                    try expectParam(&match.params, "id", "123");
+                    return error.OutOfMemory;
+                },
+                else => return err,
+            };
+            try expectOptionalSlice("suffix", removed);
+
+            router.verify();
+            try testing.expectError(error.NotFound, router.match("/foo/123bar/baz"));
+        }
+    }.run, .{});
+}
+
+test "oom remove wrong param name preserves routes" {
+    try checkAllOomPoints(struct {
+        fn run(allocator: Allocator) !void {
+            var router = lib.Router([]const u8).init(allocator);
+            defer router.deinit();
+
+            const insert_res = router.insert("/foo/{id}", "keep") catch |err| switch (err) {
+                error.OutOfMemory => {
+                    router.verify();
+                    return error.OutOfMemory;
+                },
+                else => return err,
+            };
+            try expectInsertOk(allocator, insert_res);
+
+            const removed = router.remove("/foo/{name}") catch |err| switch (err) {
+                error.OutOfMemory => {
+                    router.verify();
+                    var match = try router.match("/foo/123");
+                    defer match.deinit();
+                    try testing.expect(std.mem.eql(u8, match.value.*, "keep"));
+                    try expectParam(&match.params, "id", "123");
+                    return error.OutOfMemory;
+                },
+                else => return err,
+            };
+            try testing.expect(removed == null);
+
+            router.verify();
+            var match = try router.match("/foo/123");
+            defer match.deinit();
+            try testing.expect(std.mem.eql(u8, match.value.*, "keep"));
+            try expectParam(&match.params, "id", "123");
+        }
+    }.run, .{});
+}
+
+test "oom mergeFrom preserves routers" {
+    try checkAllOomPoints(struct {
+        fn run(allocator: Allocator) !void {
+            var root = lib.Router([]const u8).init(allocator);
+            defer root.deinit();
+
+            var child = lib.Router([]const u8).init(allocator);
+            defer child.deinit();
+
+            const root_insert = root.insert("/root", "root") catch |err| switch (err) {
+                error.OutOfMemory => {
+                    root.verify();
+                    child.verify();
+                    return error.OutOfMemory;
+                },
+                else => return err,
+            };
+            try expectInsertOk(allocator, root_insert);
+
+            const child_insert = child.insert("/child", "child") catch |err| switch (err) {
+                error.OutOfMemory => {
+                    root.verify();
+                    child.verify();
+                    return error.OutOfMemory;
+                },
+                else => return err,
+            };
+            try expectInsertOk(allocator, child_insert);
+
+            const merge_result = root.mergeFrom(&child) catch |err| switch (err) {
+                error.OutOfMemory => {
+                    root.verify();
+                    child.verify();
+                    var root_match = try root.match("/root");
+                    defer root_match.deinit();
+                    try testing.expect(std.mem.eql(u8, root_match.value.*, "root"));
+                    var child_match = try child.match("/child");
+                    defer child_match.deinit();
+                    try testing.expect(std.mem.eql(u8, child_match.value.*, "child"));
+                    return error.OutOfMemory;
+                },
+                else => return err,
+            };
+            switch (merge_result) {
+                .ok => {},
+                .err => |err_val| {
+                    var err = err_val;
+                    defer err.deinit(allocator);
+                    return error.UnexpectedMergeError;
+                },
+            }
+
+            root.verify();
+            child.verify();
+
+            var root_match = try root.match("/root");
+            defer root_match.deinit();
+            try testing.expect(std.mem.eql(u8, root_match.value.*, "root"));
+
+            var moved_match = try root.match("/child");
+            defer moved_match.deinit();
+            try testing.expect(std.mem.eql(u8, moved_match.value.*, "child"));
+
+            try testing.expectError(error.NotFound, child.match("/child"));
+        }
+    }.run, .{});
 }
 
 test "fuzz router match vs naive" {
-    const allocator = testing.allocator;
-    var router = lib.Router([]const u8).init(allocator);
-    defer router.deinit();
+    try withGpa({}, struct {
+        fn run(_: void, allocator: Allocator) !void {
+            var router = lib.Router([]const u8).init(allocator);
+            defer router.deinit();
 
-    var patterns = std.ArrayListUnmanaged(Pattern){};
-    defer {
-        for (patterns.items) |*pattern| {
-            pattern.deinit(allocator);
-        }
-        patterns.deinit(allocator);
-    }
-
-    var prng = std.Random.DefaultPrng.init(0x8d0b_4ac5_1f2a_3901);
-    const rand = prng.random();
-
-    var route_index: usize = 0;
-    while (route_index < 80) : (route_index += 1) {
-        var pattern = try generatePattern(allocator, rand, route_index);
-        switch (try router.insert(pattern.route, pattern.route)) {
-            .ok => try patterns.append(allocator, pattern),
-            .err => |err_val| {
-                var err = err_val;
-                defer err.deinit(allocator);
-                pattern.deinit(allocator);
-            },
-        }
-    }
-
-    var path_index: usize = 0;
-    while (path_index < 200) : (path_index += 1) {
-        const use_pattern_path = patterns.items.len > 0 and rand.uintLessThan(u8, 10) < 7;
-        if (use_pattern_path) {
-            const pattern_index = rand.uintLessThan(usize, patterns.items.len);
-            var expected_path = try buildPathFromPattern(allocator, rand, &patterns.items[pattern_index]);
-            defer expected_path.deinit(allocator);
-
-            if (router.match(expected_path.path)) |match_result| {
-                var match_value = match_result;
-                defer match_value.deinit();
-
-                const matched_route = match_value.value.*;
-                var matched_pattern: ?*const Pattern = null;
+            var patterns = std.ArrayListUnmanaged(Pattern){};
+            defer {
                 for (patterns.items) |*pattern| {
-                    if (std.mem.eql(u8, pattern.route, matched_route)) {
-                        matched_pattern = pattern;
-                        break;
-                    }
+                    pattern.deinit(allocator);
                 }
-                try testing.expect(matched_pattern != null);
-
-                const param_pairs_opt = try patternParams(allocator, matched_pattern.?, expected_path.path);
-                try testing.expect(param_pairs_opt != null);
-                const param_pairs = param_pairs_opt.?;
-                defer allocator.free(param_pairs);
-
-                try expectParams(&match_value.params, param_pairs);
-            } else |err| switch (err) {
-                error.NotFound => try testing.expect(false),
-                else => return err,
+                patterns.deinit(allocator);
             }
-        } else {
-            const path = try randomPath(allocator, rand);
-            defer allocator.free(path);
 
-            if (router.match(path)) |match_result| {
-                var match_value = match_result;
-                defer match_value.deinit();
+            var prng = std.Random.DefaultPrng.init(0x8d0b_4ac5_1f2a_3901);
+            const rand = prng.random();
 
-                const matched_route = match_value.value.*;
-                var matched_pattern: ?*const Pattern = null;
-                for (patterns.items) |*pattern| {
-                    if (std.mem.eql(u8, pattern.route, matched_route)) {
-                        matched_pattern = pattern;
-                        break;
-                    }
+            var route_index: usize = 0;
+            while (route_index < 80) : (route_index += 1) {
+                var pattern = try generatePattern(allocator, rand, route_index);
+                switch (try router.insert(pattern.route, pattern.route)) {
+                    .ok => try patterns.append(allocator, pattern),
+                    .err => |err_val| {
+                        var err = err_val;
+                        defer err.deinit(allocator);
+                        pattern.deinit(allocator);
+                    },
                 }
-                try testing.expect(matched_pattern != null);
+            }
 
-                const param_pairs_opt = try patternParams(allocator, matched_pattern.?, path);
-                try testing.expect(param_pairs_opt != null);
-                const param_pairs = param_pairs_opt.?;
-                defer allocator.free(param_pairs);
+            var path_index: usize = 0;
+            while (path_index < 200) : (path_index += 1) {
+                const use_pattern_path = patterns.items.len > 0 and rand.uintLessThan(u8, 10) < 7;
+                if (use_pattern_path) {
+                    const pattern_index = rand.uintLessThan(usize, patterns.items.len);
+                    var expected_path = try buildPathFromPattern(allocator, rand, &patterns.items[pattern_index]);
+                    defer expected_path.deinit(allocator);
 
-                try expectParams(&match_value.params, param_pairs);
-            } else |err| switch (err) {
-                error.NotFound => {
-                    var any_static_match = false;
-                    for (patterns.items) |*pattern| {
-                        if (patternIsAllStatic(pattern) and std.mem.eql(u8, pattern.route, path)) {
-                            any_static_match = true;
-                            break;
+                    if (router.match(expected_path.path)) |match_result| {
+                        var match_value = match_result;
+                        defer match_value.deinit();
+
+                        const matched_route = match_value.value.*;
+                        var matched_pattern: ?*const Pattern = null;
+                        for (patterns.items) |*pattern| {
+                            if (std.mem.eql(u8, pattern.route, matched_route)) {
+                                matched_pattern = pattern;
+                                break;
+                            }
                         }
+                        try testing.expect(matched_pattern != null);
+
+                        const param_pairs_opt = try patternParams(allocator, matched_pattern.?, expected_path.path);
+                        try testing.expect(param_pairs_opt != null);
+                        const param_pairs = param_pairs_opt.?;
+                        defer allocator.free(param_pairs);
+
+                        try expectParams(&match_value.params, param_pairs);
+                    } else |err| switch (err) {
+                        error.NotFound => try testing.expect(false),
+                        else => return err,
                     }
-                    try testing.expect(!any_static_match);
-                },
-                else => return err,
+                } else {
+                    const path = try randomPath(allocator, rand);
+                    defer allocator.free(path);
+
+                    if (router.match(path)) |match_result| {
+                        var match_value = match_result;
+                        defer match_value.deinit();
+
+                        const matched_route = match_value.value.*;
+                        var matched_pattern: ?*const Pattern = null;
+                        for (patterns.items) |*pattern| {
+                            if (std.mem.eql(u8, pattern.route, matched_route)) {
+                                matched_pattern = pattern;
+                                break;
+                            }
+                        }
+                        try testing.expect(matched_pattern != null);
+
+                        const param_pairs_opt = try patternParams(allocator, matched_pattern.?, path);
+                        try testing.expect(param_pairs_opt != null);
+                        const param_pairs = param_pairs_opt.?;
+                        defer allocator.free(param_pairs);
+
+                        try expectParams(&match_value.params, param_pairs);
+                    } else |err| switch (err) {
+                        error.NotFound => {
+                            var any_static_match = false;
+                            for (patterns.items) |*pattern| {
+                                if (patternIsAllStatic(pattern) and std.mem.eql(u8, pattern.route, path)) {
+                                    any_static_match = true;
+                                    break;
+                                }
+                            }
+                            try testing.expect(!any_static_match);
+                        },
+                        else => return err,
+                    }
+                }
             }
         }
-    }
+    }.run);
 }

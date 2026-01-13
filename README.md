@@ -42,7 +42,8 @@ zig build example:basic
 
 ## API notes
 - `Router(T).insert()` returns `InsertResult` (`.ok` or `.err` with an `InsertError`).
-- `Router(T).match()` returns `Match(T)` with owned params; call `deinit()` when done.
+- `Router(T).match()` returns `Match(T)` with an owned params container; call `deinit()` when done.
+- Param keys borrow from the router and are invalidated by insert/remove/merge/deinit; values borrow from the input path.
 - `Match.value` is a pointer to the stored value and is invalidated by insert/remove/merge.
 - `Router(T).matchMut()` returns a mutable value pointer with the same lifetime rules.
 - `Router(T).remove()` returns `?T` (removed value if present).

@@ -56,6 +56,7 @@ pub const UnescapedRoute = struct {
     /// Build a route from bytes, unescaping doubled braces.
     pub fn init(allocator: Allocator, bytes: []const u8) Allocator.Error!UnescapedRoute {
         var route = UnescapedRoute{};
+        errdefer route.deinit(allocator);
         try route.inner.appendSlice(allocator, bytes);
 
         var i: usize = 0;
@@ -82,6 +83,7 @@ pub const UnescapedRoute = struct {
     /// Clone the route, including escape metadata.
     pub fn clone(self: *const UnescapedRoute, allocator: Allocator) Allocator.Error!UnescapedRoute {
         var route = UnescapedRoute{};
+        errdefer route.deinit(allocator);
         try route.inner.appendSlice(allocator, self.inner.items);
         try route.escaped.appendSlice(allocator, self.escaped.items);
         return route;
@@ -91,6 +93,36 @@ pub const UnescapedRoute = struct {
     pub fn toOwnedUnescaped(self: *const UnescapedRoute, allocator: Allocator) Allocator.Error![]u8 {
         const out = try allocator.alloc(u8, self.inner.items.len);
         @memcpy(out, self.inner.items);
+        return out;
+    }
+
+    /// Return a newly allocated copy of the escaped route bytes.
+    pub fn toOwnedEscaped(self: *const UnescapedRoute, allocator: Allocator) Allocator.Error![]u8 {
+        assertEscapedInvariant(self.escaped.items, self.inner.items.len);
+        if (self.escaped.items.len == 0) {
+            return self.toOwnedUnescaped(allocator);
+        }
+
+        const out_len = self.inner.items.len + self.escaped.items.len;
+        const out = try allocator.alloc(u8, out_len);
+        var out_idx: usize = 0;
+        var esc_idx: usize = 0;
+        var i: usize = 0;
+        while (i < self.inner.items.len) : (i += 1) {
+            const byte = self.inner.items[i];
+            if (esc_idx < self.escaped.items.len and self.escaped.items[esc_idx] == i) {
+                out[out_idx] = byte;
+                out[out_idx + 1] = byte;
+                out_idx += 2;
+                esc_idx += 1;
+            } else {
+                out[out_idx] = byte;
+                out_idx += 1;
+            }
+        }
+
+        std.debug.assert(out_idx == out_len);
+        std.debug.assert(esc_idx == self.escaped.items.len);
         return out;
     }
 
@@ -200,6 +232,7 @@ pub const UnescapedRef = struct {
     /// Convert the view into an owned UnescapedRoute.
     pub fn toOwned(self: UnescapedRef, allocator: Allocator) Allocator.Error!UnescapedRoute {
         var route = UnescapedRoute{};
+        errdefer route.deinit(allocator);
         try route.inner.appendSlice(allocator, self.inner);
 
         const len_isize = @as(isize, @intCast(self.inner.len));
@@ -280,4 +313,67 @@ pub fn findWildcard(path: UnescapedRef) ParamError!?Range {
     }
 
     return null;
+}
+
+fn expectEscapedIndices(route_value: *const UnescapedRoute, expected: []const usize) !void {
+    try std.testing.expectEqual(expected.len, route_value.escaped.items.len);
+    var i: usize = 0;
+    while (i < expected.len) : (i += 1) {
+        try std.testing.expectEqual(expected[i], route_value.escaped.items[i]);
+        try std.testing.expect(route_value.isEscaped(expected[i]));
+    }
+}
+
+test "escape tracking across splice and truncate" {
+    const allocator = std.testing.allocator;
+
+    {
+        var route_value = try UnescapedRoute.init(allocator, "/a/{{b}}/{{c}}");
+        defer route_value.deinit(allocator);
+
+        try route_value.splice(allocator, .{ .start = 0, .end = 2 }, "/alpha");
+        try std.testing.expectEqualStrings("/alpha/{b}/{c}", route_value.unescaped());
+        try expectEscapedIndices(&route_value, &[_]usize{ 7, 9, 11, 13 });
+    }
+
+    {
+        var route_value = try UnescapedRoute.init(allocator, "/a/{{b}}/{{c}}");
+        defer route_value.deinit(allocator);
+
+        try route_value.splice(allocator, .{ .start = 3, .end = 6 }, "x");
+        try std.testing.expectEqualStrings("/a/x/{c}", route_value.unescaped());
+        try expectEscapedIndices(&route_value, &[_]usize{ 5, 7 });
+    }
+
+    {
+        var route_value = try UnescapedRoute.init(allocator, "/a/{{b}}/{{c}}/tail");
+        defer route_value.deinit(allocator);
+
+        try route_value.splice(allocator, .{ .start = 11, .end = 15 }, "pathology");
+        try std.testing.expectEqualStrings("/a/{b}/{c}/pathology", route_value.unescaped());
+        try expectEscapedIndices(&route_value, &[_]usize{ 3, 5, 7, 9 });
+    }
+
+    {
+        var route_value = try UnescapedRoute.init(allocator, "/a/{{b}}/{{c}}");
+        defer route_value.deinit(allocator);
+
+        route_value.truncate(8);
+        try std.testing.expectEqualStrings("/a/{b}/{", route_value.unescaped());
+        try expectEscapedIndices(&route_value, &[_]usize{ 3, 5, 7 });
+    }
+}
+
+test "escape tracking across append" {
+    const allocator = std.testing.allocator;
+
+    var left = try UnescapedRoute.init(allocator, "/a/{{b}}");
+    defer left.deinit(allocator);
+
+    var right = try UnescapedRoute.init(allocator, "/{{c}}");
+    defer right.deinit(allocator);
+
+    try left.append(allocator, &right);
+    try std.testing.expectEqualStrings("/a/{b}/{c}", left.unescaped());
+    try expectEscapedIndices(&left, &[_]usize{ 3, 5, 7, 9 });
 }
